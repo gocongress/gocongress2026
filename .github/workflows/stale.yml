@@ -31,11 +31,15 @@ jobs:
       - name: Find inactive issues
         id: stale
         uses: actions/github-script@v7
+        env:
+          PROJECT_NUMBER: ${{ vars.PROJECT_NUMBER }}
         with:
           github-token: ${{ steps.generate_token.outputs.token }}
           script: |
             const days = Number("${{ steps.threshold.outputs.days }}");
+            const projectNumber = Number(process.env.PROJECT_NUMBER);
             const cutoff = new Date(Date.now() - days * 24*60*60*1000);
+            const now = new Date();
 
             const issues = await github.paginate(
               github.rest.issues.listForRepo,
@@ -50,14 +54,27 @@ jobs:
 
             let staleIssues = [];
 
-            // Check for active children (transitive activity, 2 levels deep)
+            // Iterate candidates to check Project Start Date and Transitive Activity
             for (const issue of candidates) {
-              let hasActiveChild = false;
               try {
+                // Combined Query: Get Tracked Issues (for activity) AND Project Items (for Start Date)
                 const query = `
                   query($owner: String!, $repo: String!, $number: Int!) {
                     repository(owner: $owner, name: $repo) {
                       issue(number: $number) {
+                        projectItems(first: 10) {
+                          nodes {
+                            project { number }
+                            fieldValues(first: 20) {
+                              nodes {
+                                ... on ProjectV2ItemFieldDateValue {
+                                  field { ... on ProjectV2FieldCommon { name } }
+                                  date
+                                }
+                              }
+                            }
+                          }
+                        }
                         trackedIssues(first: 20) {
                           nodes {
                             updatedAt
@@ -70,12 +87,28 @@ jobs:
                     }
                   }
                 `;
+                
                 const data = await github.graphql(query, {
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   number: issue.number
                 });
 
+                // --- CHECK 1: Start Date (Don't stale if in future) ---
+                const pItems = data.repository.issue.projectItems.nodes;
+                const projectItem = pItems.find(i => i.project?.number === projectNumber);
+                
+                if (projectItem) {
+                  const startDateStr = projectItem.fieldValues.nodes.find(f => f.field?.name === "Start Date")?.date;
+                  if (startDateStr) {
+                    const startDate = new Date(startDateStr);
+                    // If start date is in the future, skip this issue entirely (do not mark stale)
+                    if (startDate > now) continue;
+                  }
+                }
+
+                // --- CHECK 2: Active Children (Transitive activity) ---
+                let hasActiveChild = false;
                 const children = data.repository.issue.trackedIssues.nodes;
                 
                 // Check direct children
@@ -87,12 +120,14 @@ jobs:
                     child.trackedIssues.nodes.some(grandChild => new Date(grandChild.updatedAt) >= cutoff)
                   );
                 }
-              } catch (error) {
-                console.log(`Error checking tracked issues for #${issue.number}: ${error.message}`);
-              }
 
-              if (!hasActiveChild) {
-                staleIssues.push(issue);
+                // Only add to stale list if children are inactive
+                if (!hasActiveChild) {
+                  staleIssues.push(issue);
+                }
+
+              } catch (error) {
+                console.log(`Error processing #${issue.number}: ${error.message}`);
               }
             }
 
