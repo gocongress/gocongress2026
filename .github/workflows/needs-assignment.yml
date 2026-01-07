@@ -1,0 +1,102 @@
+name: Detect Unassigned Started Issues
+
+on:
+  schedule:
+    - cron: "15 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  needs-assignment:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+      - name: Generate App Token
+        id: generate_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app_id: ${{ secrets.APP_ID }}
+          private_key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Flag issues past start date with no assignee
+        uses: actions/github-script@v7
+        env:
+          PROJECT_NUMBER: ${{ vars.PROJECT_NUMBER }}
+          ORGANIZER: ${{ vars.ORGANIZER }}
+        with:
+          github-token: ${{ steps.generate_token.outputs.token }}
+          script: |
+            const projectNumber = Number(process.env.PROJECT_NUMBER);
+            const organizersRaw = process.env.ORGANIZER || "";
+            const organizers = organizersRaw.split(',').map(s => s.trim()).filter(s => s);
+            const pingText = organizers.map(o => `@${o}`).join(' ');
+            const GRACE_MS = 60 * 60 * 1000; // 1 hour
+
+            const issues = await github.paginate(
+              github.rest.issues.listForRepo,
+              { owner: context.repo.owner, repo: context.repo.repo, state: "open" }
+            );
+
+            const now = Date.now();
+
+            for (const issue of issues) {
+              const createdAt = new Date(issue.created_at).getTime();
+              if (now - createdAt < GRACE_MS) continue;
+
+              const q = await github.graphql(`
+                query($owner: String!, $repo: String!, $issue: Int!) {
+                  repository(owner: $owner, name: $repo) {
+                    issue(number: $issue) {
+                      projectItems(first: 10) {
+                        nodes {
+                          project { ... on ProjectV2 { number } }
+                          fieldValues(first: 20) {
+                            nodes {
+                              ... on ProjectV2ItemFieldDateValue {
+                                field {
+                                  ... on ProjectV2Field { name }
+                                }
+                                date
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              `, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue: issue.number
+              });
+
+              const items = q.repository.issue.projectItems.nodes;
+              if (!items || items.length === 0) continue;
+
+              const item = items.find(i => i.project?.number === projectNumber);
+              if (!item) continue;
+
+              const start = item.fieldValues.nodes.find(f => f.field?.name === "Start Date")?.date;
+              if (!start) continue;
+
+              const startDate = new Date(start);
+
+              if (now > startDate && !issue.assignee && !issue.labels.some(l => l.name === "needs-assignment")) {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  labels: ["needs-assignment"]
+                });
+
+                // This comment will now appear as the GitHub App Bot
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: `${pingText} This issue is past its start date and still unassigned.`
+                });
+              }
+            }

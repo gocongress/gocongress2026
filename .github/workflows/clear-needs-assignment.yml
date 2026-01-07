@@ -1,0 +1,31 @@
+name: Remove needs-assignment on assignment
+
+on:
+  issues:
+    types: [assigned]
+
+jobs:
+  clear_flag:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Generate App Token
+        id: generate_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app_id: ${{ secrets.APP_ID }}
+          private_key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.generate_token.outputs.token }}
+          script: |
+            const issue = context.payload.issue;
+            if (!issue.labels.map(l => l.name).includes("needs-assignment")) return;
+
+            await github.rest.issues.removeLabel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              name: "needs-assignment"
+            });

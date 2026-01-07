@@ -1,0 +1,157 @@
+name: Mark Stale Issues
+
+on:
+  schedule:
+    - cron: "30 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  mark-stale:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+      - name: Generate App Token
+        id: generate_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app_id: ${{ secrets.APP_ID }}
+          private_key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Get stale threshold
+        id: threshold
+        run: |
+          if [[ "${{ contains(github.event.issue.labels.*.name, 'long-task') }}" == "true" ]]; then
+            echo "days=30" >> $GITHUB_OUTPUT
+          else
+            echo "days=14" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Find inactive issues
+        id: stale
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.generate_token.outputs.token }}
+          script: |
+            const days = Number("${{ steps.threshold.outputs.days }}");
+            const cutoff = new Date(Date.now() - days * 24*60*60*1000);
+
+            const issues = await github.paginate(
+              github.rest.issues.listForRepo,
+              { owner: context.repo.owner, repo: context.repo.repo, state: "open" }
+            );
+
+            // Initial filter: updated time and label
+            let candidates = issues.filter(i => {
+              const updated = new Date(i.updated_at);
+              return updated < cutoff && !i.labels.some(l => l.name === "stale");
+            });
+
+            let staleIssues = [];
+
+            // Check for active children (transitive activity, 2 levels deep)
+            for (const issue of candidates) {
+              let hasActiveChild = false;
+              try {
+                const query = `
+                  query($owner: String!, $repo: String!, $number: Int!) {
+                    repository(owner: $owner, name: $repo) {
+                      issue(number: $number) {
+                        trackedIssues(first: 20) {
+                          nodes {
+                            updatedAt
+                            trackedIssues(first: 10) {
+                              nodes { updatedAt }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                `;
+                const data = await github.graphql(query, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  number: issue.number
+                });
+
+                const children = data.repository.issue.trackedIssues.nodes;
+                
+                // Check direct children
+                if (children.some(child => new Date(child.updatedAt) >= cutoff)) {
+                  hasActiveChild = true;
+                } else {
+                  // Check grandchildren
+                  hasActiveChild = children.some(child => 
+                    child.trackedIssues.nodes.some(grandChild => new Date(grandChild.updatedAt) >= cutoff)
+                  );
+                }
+              } catch (error) {
+                console.log(`Error checking tracked issues for #${issue.number}: ${error.message}`);
+              }
+
+              if (!hasActiveChild) {
+                staleIssues.push(issue);
+              }
+            }
+
+            return staleIssues;
+
+      - name: Apply stale to issues
+        if: steps.stale.outputs.result != '[]'
+        uses: actions/github-script@v7
+        env:
+          STALE_ISSUES: ${{ steps.stale.outputs.result }}
+        with:
+          github-token: ${{ steps.generate_token.outputs.token }}
+          script: |
+            const staleIssues = JSON.parse(process.env.STALE_ISSUES);
+            for (const issue of staleIssues) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                labels: ["stale"]
+              });
+
+              if (issue.assignee) {
+                // Comment will appear as Bot
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: `@${issue.assignee.login} This issue has gone stale. Please update or comment to keep it active.`
+                });
+              }
+            }
+
+  remove-stale-on-comment:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'issue_comment'
+
+    permissions:
+      issues: write
+
+    steps:
+      - name: Generate App Token
+        id: generate_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app_id: ${{ secrets.APP_ID }}
+          private_key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Remove stale label when comment added
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.generate_token.outputs.token }}
+          script: |
+            const issue = context.payload.issue;
+            if (issue.labels.some(l => l.name === "stale")) {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                name: "stale"
+              });
+            }

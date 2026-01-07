@@ -1,0 +1,176 @@
+name: Activate Future Issues
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  activate-future:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+      - name: Generate App Token
+        id: generate_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app_id: ${{ secrets.APP_ID }}
+          private_key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Move 'Future' issues to 'Discuss' on Start Date
+        uses: actions/github-script@v7
+        env:
+          PROJECT_NUMBER: ${{ vars.PROJECT_NUMBER }}
+        with:
+          github-token: ${{ steps.generate_token.outputs.token }}
+          script: |
+            const projectNumber = Number(process.env.PROJECT_NUMBER);
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            
+            console.log(`--- CONFIGURATION ---`);
+            console.log(`Owner: ${owner}, Repo: ${repo}`);
+            console.log(`Target Project Number: ${projectNumber}`);
+
+            // 1. Get Project Data (Project ID and Status Options)
+            const projectQuery = await github.graphql(`
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  owner {
+                    ... on Organization {
+                      projectV2(number: $number) {
+                        id
+                        field(name: "Status") {
+                          ... on ProjectV2SingleSelectField {
+                            id
+                            options { id name }
+                          }
+                        }
+                      }
+                    }
+                    ... on User {
+                      projectV2(number: $number) {
+                        id
+                        field(name: "Status") {
+                          ... on ProjectV2SingleSelectField {
+                            id
+                            options { id name }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `, { owner, repo, number: projectNumber });
+
+            const projectNode = projectQuery.repository.owner.projectV2;
+            
+            if (!projectNode) {
+              console.log(`🛑 ERROR: Project #${projectNumber} not found. Check permissions and Project Number.`);
+              return;
+            }
+
+            const projectId = projectNode.id;
+            const statusField = projectNode.field;
+            
+            if (!statusField) {
+              console.log(`🛑 ERROR: Field "Status" not found in Project #${projectNumber}.`);
+              return;
+            }
+
+            const futureOption = statusField.options.find(o => o.name === "Future");
+            const discussOption = statusField.options.find(o => o.name === "Discuss");
+            
+            const statusFieldId = statusField.id;
+
+            if (!futureOption || !discussOption) {
+              console.log(`🛑 ERROR: Missing one of the required status options.`);
+              return;
+            }
+
+            // 2. Iterate Issues
+            const issues = await github.paginate(
+              github.rest.issues.listForRepo,
+              { owner, repo, state: "open" }
+            );
+
+            console.log(`--- PROCESSING ${issues.length} OPEN ISSUES ---`);
+
+            const now = new Date();
+            now.setHours(0, 0, 0, 0);
+
+            for (const issue of issues) {
+              const q = await github.graphql(`
+                query($owner: String!, $repo: String!, $issue: Int!) {
+                  repository(owner: $owner, name: $repo) {
+                    issue(number: $issue) {
+                      projectItems(first: 10) {
+                        nodes {
+                          id
+                          project { number }
+                          fieldValues(first: 50) {
+                            nodes {
+                              ... on ProjectV2ItemFieldDateValue {
+                                field {
+                                  ... on ProjectV2FieldCommon { id name }
+                                }
+                                date
+                              }
+                              ... on ProjectV2ItemFieldSingleSelectValue {
+                                field {
+                                  ... on ProjectV2FieldCommon { id name }
+                                }
+                                name
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              `, { owner, repo, issue: issue.number });
+
+              const items = q.repository.issue.projectItems.nodes;
+              if (!items) continue;
+              
+              const item = items.find(i => i.project?.number === projectNumber);
+              if (!item) continue;
+
+              const startDateStr = item.fieldValues.nodes.find(f => f.field?.name === "Start Date")?.date;
+              
+              const statusNode = item.fieldValues.nodes.find(f => f.field?.id === statusFieldId);
+              const currentStatus = statusNode ? statusNode.name : undefined;
+              
+              if (!startDateStr) continue;
+
+              if (currentStatus !== "Future") continue;
+
+              const startDate = new Date(startDateStr);
+              startDate.setUTCHours(0, 0, 0, 0);
+
+              if (startDate <= now) {
+                console.log(`✅ ACTIVATE: Moving Issue #${issue.number} to Discuss.`);
+                
+                await github.graphql(`
+                  mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                    updateProjectV2ItemFieldValue(input: {
+                      projectId: $projectId
+                      itemId: $itemId
+                      fieldId: $fieldId
+                      value: { singleSelectOptionId: $optionId }
+                    }) {
+                      projectV2Item { id }
+                    }
+                  }
+                `, {
+                  projectId: projectId,
+                  itemId: item.id,
+                  fieldId: statusFieldId,
+                  optionId: discussOption.id
+                });
+              }
+            }
