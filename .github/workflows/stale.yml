@@ -151,31 +151,26 @@ jobs:
                   continue; // Skip further processing
                 }
 
-                // 6. Check Activity (Only if Start Date is valid and in past)
-                
-                // Determine cutoff
+                // 6. Check Activity
+                // Calculate threshold
                 const days = issue.labels.some(l => l.name === 'long-task') ? DAYS_LONG : DAYS_DEFAULT;
                 const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-                
-                // Check Self Update
-                if (new Date(issue.updated_at) >= cutoff) {
-                  // Active: cleanup if stale
-                  if (isStale) {
-                    console.log(`Issue #${issue.number}: Active (self updated). Removing stale.`);
-                    await github.rest.issues.removeLabel({
-                      owner: context.repo.owner,
-                      repo: context.repo.repo,
-                      issue_number: issue.number,
-                      name: STALE_LABEL
-                    });
-                  }
-                  continue;
+
+                // --- CHECK 6a: Self Update (LOOP FIX) ---
+                // If the issue is NOT stale, we check if it was updated recently.
+                // If the issue IS stale, we IGNORE the update time here, because the last update 
+                // was likely the Bot itself. We rely on the 'issue_comment' job to un-stale via comments.
+                if (!isStale && new Date(issue.updated_at) >= cutoff) {
+                   continue; // It is active, do not mark stale
                 }
 
-                // Check Children Update (Transitive Activity)
+                // --- CHECK 6b: Child/Grandchild Activity (Transitive) ---
+                // It IS safe to un-stale based on children, because the bot comment on the parent
+                // does not change the updatedAt timestamp of the children.
                 let hasActiveChild = false;
                 const children = issueData.trackedIssues.nodes;
                 
+                // Check direct children
                 if (children.some(child => new Date(child.updatedAt) >= cutoff)) {
                   hasActiveChild = true;
                 } else {
@@ -186,7 +181,6 @@ jobs:
                 }
 
                 if (hasActiveChild) {
-                  // Active: cleanup if stale
                   if (isStale) {
                     console.log(`Issue #${issue.number}: Active (children updated). Removing stale.`);
                     await github.rest.issues.removeLabel({
@@ -196,10 +190,10 @@ jobs:
                       name: STALE_LABEL
                     });
                   }
-                  continue;
+                  continue; // Skip further processing
                 }
 
-                // 7. Mark Stale (If inactive and not already stale)
+                // 7. Mark Stale (Only if currently NOT stale)
                 if (!isStale) {
                   console.log(`Marking issue #${issue.number} as stale.`);
                   await github.rest.issues.addLabels({
