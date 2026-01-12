@@ -29,36 +29,39 @@ jobs:
             const projectNumber = Number(process.env.PROJECT_NUMBER);
             const now = new Date();
             
-            // Define thresholds
+            // Configuration
             const DAYS_DEFAULT = 14;
             const DAYS_LONG = 30;
+            const STALE_LABEL = "stale";
 
-            // Fetch all open issues
+            // Helper to extract Start Date from Project Items
+            function getStartDateFromItems(nodes) {
+              if (!nodes) return null;
+              const item = nodes.find(i => i.project?.number === projectNumber);
+              if (!item) return null;
+              
+              const dateVal = item.fieldValues.nodes.find(f => f.field?.name === "Start Date")?.date;
+              return dateVal ? new Date(dateVal) : null;
+            }
+
+            // 1. Fetch all open issues
             const issues = await github.paginate(
               github.rest.issues.listForRepo,
               { owner: context.repo.owner, repo: context.repo.repo, state: "open" }
             );
 
-            console.log(`Found ${issues.length} open issues. Starting checks...`);
+            console.log(`Found ${issues.length} open issues.`);
 
             for (const issue of issues) {
               try {
-                // Skip if already stale
-                if (issue.labels.some(l => l.name === "stale")) continue;
+                const isStale = issue.labels.some(l => l.name === STALE_LABEL);
 
-                // 1. Determine Threshold based on label
-                const days = issue.labels.some(l => l.name === 'long-task') ? DAYS_LONG : DAYS_DEFAULT;
-                const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-                
-                // 2. Check Last Update Time
-                const updated = new Date(issue.updated_at);
-                if (updated >= cutoff) continue; // It is active, skip it
-
-                // 3. GraphQL Check: Project Start Date & Child Activity
+                // 2. Fetch GraphQL Data (Self + Parent + Activity)
                 const query = `
                   query($owner: String!, $repo: String!, $number: Int!) {
                     repository(owner: $owner, name: $repo) {
                       issue(number: $number) {
+                        # Self Start Date
                         projectItems(first: 10) {
                           nodes {
                             project { number }
@@ -72,6 +75,25 @@ jobs:
                             }
                           }
                         }
+                        # Parent Start Date (TrackedInIssues)
+                        trackedInIssues(first: 1) {
+                          nodes {
+                            projectItems(first: 10) {
+                              nodes {
+                                project { number }
+                                fieldValues(first: 20) {
+                                  nodes {
+                                    ... on ProjectV2ItemFieldDateValue {
+                                      field { ... on ProjectV2FieldCommon { name } }
+                                      date
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                        # Activity Check
                         trackedIssues(first: 20) {
                           nodes {
                             updatedAt
@@ -91,23 +113,69 @@ jobs:
                   number: issue.number
                 });
 
-                // --- CHECK 3a: Start Date ---
-                const pItems = data.repository.issue.projectItems.nodes;
-                const projectItem = pItems.find(i => i.project?.number === projectNumber);
+                const issueData = data.repository.issue;
+
+                // 3. Determine Effective Start Date
+                let startDate = getStartDateFromItems(issueData.projectItems.nodes);
                 
-                if (projectItem) {
-                  const startDateStr = projectItem.fieldValues.nodes.find(f => f.field?.name === "Start Date")?.date;
-                  if (startDateStr) {
-                    const startDate = new Date(startDateStr);
-                    if (startDate > now) continue; // Start date in future, skip
-                  }
+                // Fallback to Parent if no start date found
+                if (!startDate && issueData.trackedInIssues.nodes.length > 0) {
+                  startDate = getStartDateFromItems(issueData.trackedInIssues.nodes[0].projectItems.nodes);
                 }
 
-                // --- CHECK 3b: Active Children ---
-                let hasActiveChild = false;
-                const children = data.repository.issue.trackedIssues.nodes;
+                // 4. RULE: No Start Date = Protected (Cleanup & Skip)
+                if (!startDate) {
+                  if (isStale) {
+                    console.log(`Issue #${issue.number}: No Start Date (Self or Parent). Removing stale.`);
+                    await github.rest.issues.removeLabel({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: issue.number,
+                      name: STALE_LABEL
+                    });
+                  }
+                  continue; // Skip further processing
+                }
+
+                // 5. RULE: Future Start Date = Protected (Cleanup & Skip)
+                if (startDate > now) {
+                  if (isStale) {
+                    console.log(`Issue #${issue.number}: Start Date is in future. Removing stale.`);
+                    await github.rest.issues.removeLabel({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: issue.number,
+                      name: STALE_LABEL
+                    });
+                  }
+                  continue; // Skip further processing
+                }
+
+                // 6. Check Activity (Only if Start Date is valid and in past)
                 
-                // Check direct children
+                // Determine cutoff
+                const days = issue.labels.some(l => l.name === 'long-task') ? DAYS_LONG : DAYS_DEFAULT;
+                const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+                
+                // Check Self Update
+                if (new Date(issue.updated_at) >= cutoff) {
+                  // Active: cleanup if stale
+                  if (isStale) {
+                    console.log(`Issue #${issue.number}: Active (self updated). Removing stale.`);
+                    await github.rest.issues.removeLabel({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: issue.number,
+                      name: STALE_LABEL
+                    });
+                  }
+                  continue;
+                }
+
+                // Check Children Update (Transitive Activity)
+                let hasActiveChild = false;
+                const children = issueData.trackedIssues.nodes;
+                
                 if (children.some(child => new Date(child.updatedAt) >= cutoff)) {
                   hasActiveChild = true;
                 } else {
@@ -117,25 +185,38 @@ jobs:
                   );
                 }
 
-                if (hasActiveChild) continue; // Children active, skip
+                if (hasActiveChild) {
+                  // Active: cleanup if stale
+                  if (isStale) {
+                    console.log(`Issue #${issue.number}: Active (children updated). Removing stale.`);
+                    await github.rest.issues.removeLabel({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: issue.number,
+                      name: STALE_LABEL
+                    });
+                  }
+                  continue;
+                }
 
-                // --- ACTION: Mark Stale ---
-                console.log(`Marking issue #${issue.number} as stale.`);
-                
-                await github.rest.issues.addLabels({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: issue.number,
-                  labels: ["stale"]
-                });
-
-                if (issue.assignee) {
-                  await github.rest.issues.createComment({
+                // 7. Mark Stale (If inactive and not already stale)
+                if (!isStale) {
+                  console.log(`Marking issue #${issue.number} as stale.`);
+                  await github.rest.issues.addLabels({
                     owner: context.repo.owner,
                     repo: context.repo.repo,
                     issue_number: issue.number,
-                    body: `@${issue.assignee.login} This issue has gone stale. Please update or comment to keep it active.`
+                    labels: [STALE_LABEL]
                   });
+
+                  if (issue.assignee) {
+                    await github.rest.issues.createComment({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: issue.number,
+                      body: `@${issue.assignee.login} This issue has gone stale. Please update or comment to keep it active.`
+                    });
+                  }
                 }
 
               } catch (error) {
@@ -146,7 +227,6 @@ jobs:
   remove-stale-on-comment:
     runs-on: ubuntu-latest
     if: github.event_name == 'issue_comment'
-
     permissions:
       issues: write
 
